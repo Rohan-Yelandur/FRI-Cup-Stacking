@@ -27,6 +27,11 @@ class RedObjectDetector:
             mask1 = cv2.inRange(hsv, lower_red1, upper_red1)
             mask2 = cv2.inRange(hsv, lower_red2, upper_red2)
             mask = mask1 + mask2
+
+            # Apply morphological operations to clean up the mask
+            kernel = np.ones((5, 5), np.uint8)
+            mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel)  # Remove small noise
+            mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel) # Fill small holes
             
             # Find contours in the mask
             # Only draw contours around the outermost countours
