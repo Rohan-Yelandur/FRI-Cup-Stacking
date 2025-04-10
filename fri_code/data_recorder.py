@@ -3,13 +3,13 @@ import threading
 import time
 
 import cv2
-import h5py
 import intera_interface
 import numpy as np
 import pyrealsense2 as rs
 import rospy
 from matplotlib import pyplot as plt
 from pynput import keyboard
+from lerobot.common.datasets.lerobot_dataset import LeRobotDataset, LEROBOT_HOME
 
 IMG_X = 640  # Camera observation width
 IMG_Y = 480  # Camera observation height
@@ -39,48 +39,71 @@ class RealSenseCamera:
 
 
 class Recorder:
-    """Class to record states, actions, and observations of the Sawyer Robot's end effector"""
+    """Class to record states, actions, and observations of the Sawyer Robot's end effector in LeRobot format"""
 
-    def __init__(self, file: h5py.File, camera: RealSenseCamera, sample_interval: float,
+    def __init__(self, dataset_name: str, camera: RealSenseCamera, sample_interval: float,
                  store_observations: bool = False, side="right"):
-        """Initialize the recorder with the HDF5 file, sampling interval, and demonstration recording parameters"""
-        self.file = file
-        self.filename = self.file.filename[0:self.file.filename.index(".")]
+        """Initialize the recorder with LeRobot dataset, sampling interval, and demonstration recording parameters"""
+        self.dataset_name = dataset_name
         self.sample_interval = sample_interval
         self.store_observations = store_observations
-        if self.store_observations:
-            os.mkdir(f"{self.filename}/")
+        
+        # Create the LeRobot dataset
+        self.dataset = LeRobotDataset.create(
+            repo_id=dataset_name,
+            robot_type="sawyer",
+            fps=1/sample_interval,
+            features={
+                "observation.image": {
+                    "dtype": "image",
+                    "shape": (IMG_Y, IMG_X, 3),
+                    "names": ["height", "width", "channel"],
+                },
+                "observation.state.position": {
+                    "dtype": "float32",
+                    "shape": (3,),
+                    "names": ["x", "y", "z"],
+                },
+                "observation.state.orientation": {
+                    "dtype": "float32",
+                    "shape": (4,),
+                    "names": ["x", "y", "z", "w"],
+                },
+                "observation.state.gripper_status": {
+                    "dtype": "float32",
+                    "shape": (1,),
+                    "names": ["gripper_status"],
+                }
+                "action.delta_position": {
+                    "dtype": "float32",
+                    "shape": (3,),
+                    "names": ["x", "y", "z"],
+                },
+                "action.delta_orientation": {
+                    "dtype": "float32",
+                    "shape": (4,),
+                    "names": ["x", "y", "z", "w"],
+                },
+                "timestamp": {
+                    "dtype": "float32",
+                    "shape": (1,),
+                    "names": ["seconds"],
+                },
+            },
+            image_writer_threads=5,
+        )
 
         self.limb = intera_interface.Limb(side)
+        self.gripper = intera_interface.Gripper(side)
         self.camera = camera
-
-        # Custom datatype for storing intera_interface.Limb().endpoint_pose() in a HDF5 dataset
-        self.dt = np.dtype([
-            ('position', np.float32, (3,)),
-            ('orientation', np.float32, (4,))
-        ])
 
         # Demonstration recording initialization
         self.demo_num = 0
         self.recording = False
         self.sample_count = 0
-        self.demo_group = None
         self.prev_state = None
         self.record_thread = None
-
-    def setup_group(self, demo_num: int, description: str):
-        """Create an HDF5 group for storing timestamps, states, actions, and observations for a given demonstration."""
-        demo_group = self.file.create_group(f"demo_{demo_num}")
-        demo_group.attrs["description"] = description  # Optional, text-based description of demonstration
-        demo_group.attrs["num_samples"] = 0
-
-        # Datasets start with 0 elements but will be resized when storing data
-        demo_group.create_dataset("timestamps", (0,), maxshape=(None,), dtype="float32")
-        demo_group.create_dataset("states", (0,), maxshape=(None,), dtype=self.dt)
-        demo_group.create_dataset("actions", (0,), maxshape=(None,), dtype=self.dt)
-        demo_group.create_dataset("observations", (0, IMG_Y, IMG_X, 3), maxshape=(None, IMG_Y, IMG_X, 3), dtype='uint8')
-
-        self.demo_group = demo_group
+        self.start_time = None
 
     def start_recording(self):
         """Begin recording data by initializing a thread to collect samples every sample_interval seconds."""
@@ -88,8 +111,7 @@ class Recorder:
         description = f"Sample demonstration {self.demo_num}"
         # Uncomment the line below to add descriptions to demonstrations
         # description = input("Enter the description for this demonstration...\n")
-        self.setup_group(self.demo_num, description)
-        self.demo_group.attrs["start_time"] = time.time()
+        self.start_time = time.time()
         self.sample_count = 0
         self.prev_state = None
         self.record_thread = threading.Thread(target=self.record_sample_thread, args=())
@@ -99,36 +121,31 @@ class Recorder:
     def stop_recording(self):
         """Stop the recording process and finalize the data in the current demonstration."""
         if self.recording:
-            self.demo_group.attrs["end_time"] = time.time()
-            self.demo_group.attrs["num_samples"] = self.sample_count
-            self.demo_num += 1
             self.recording = False
             self.record_thread.join()
+            
+            # Save the episode with a task description
+            description = f"Sample demonstration {self.demo_num}"
+            self.dataset.save_episode(task=description)
+            
+            self.demo_num += 1
             print(f"\nDemonstration {self.demo_num} recorded.")
             print("Press <ENTER> to start recording another demonstration or press <q> to exit the program.")
 
     def record_sample(self):
-        """Store endpoint state, action taken since last sample, and an observation within its respective dataset."""
+        """Store endpoint state, action, and observation as a frame in LeRobot dataset."""
         if self.recording and not rospy.is_shutdown():
-            timestamp_time = time.time() - self.demo_group.attrs["start_time"]
+            timestamp_time = time.time() - self.start_time
             endpoint_pose = self.limb.endpoint_pose()
             position = endpoint_pose["position"]
             orientation = endpoint_pose["orientation"]
+            gripper_status = self.gripper.state()
+            observation = self.camera.get_frame()
 
-            timestamps = self.demo_group["timestamps"]
-            states = self.demo_group["states"]
-            actions = self.demo_group["actions"]
-            observations = self.demo_group["observations"]
-
-            timestamps.resize((self.sample_count + 1,))
-            states.resize((self.sample_count + 1,))
-            actions.resize((self.sample_count + 1,))
-            observations.resize((self.sample_count + 1, IMG_Y, IMG_X, 3))
-
-            timestamps[self.sample_count] = timestamp_time
-            states[self.sample_count] = (position, orientation)
+            # Calculate delta actions
             if self.prev_state is None:  # The first action should just be the first state
-                actions[self.sample_count] = (position, orientation)
+                delta_position = position
+                delta_orientation = orientation
             else:
                 curr_x, curr_y, curr_z = endpoint_pose["position"]
                 prev_x, prev_y, prev_z = self.prev_state["position"]
@@ -151,23 +168,36 @@ class Recorder:
                 delta_z = prev_conj_w * curr_z + prev_conj_x * curr_y - prev_conj_y * curr_x + prev_conj_z * curr_w
 
                 delta_orientation = intera_interface.Limb.Quaternion(delta_x, delta_y, delta_z, delta_w)
-                actions[self.sample_count] = (delta_position, delta_orientation)
+
             self.prev_state = endpoint_pose
-            observation = self.camera.get_frame()
-            observations[self.sample_count] = observation
+            
+            # Add frame to LeRobot dataset
+            self.dataset.add_frame({
+                "observation.image": observation,
+                "observation.state.position": np.array(position, dtype=np.float32),
+                "observation.state.orientation": np.array(orientation, dtype=np.float32),
+                "observation.state.gripper_status": np.array([gripper_status], dtype=np.float32),
+                "action.delta_position": np.array(delta_position, dtype=np.float32),
+                "action.delta_orientation": np.array(delta_orientation, dtype=np.float32),
+                "timestamp": np.array([timestamp_time], dtype=np.float32),
+            })
+            
+            # Optionally save images separately
             if self.store_observations:
-                if not os.path.exists(f"{self.filename}/demo_{self.demo_num}"):
-                    os.mkdir(f"{self.filename}/demo_{self.demo_num}/")
+                # Create output directory if it doesn't exist
+                os.makedirs(f"{self.dataset_name}/demo_{self.demo_num}", exist_ok=True)
                 try:
-                    plt.imsave(f"{self.filename}/demo_{self.demo_num}/sample_{self.sample_count}.png", observation)
-                except FileNotFoundError:  # Unable to write image to filesystem
+                    plt.imsave(f"{self.dataset_name}/demo_{self.demo_num}/sample_{self.sample_count}.png", observation)
+                except FileNotFoundError:
                     pass
 
             print(f"Sample {self.sample_count}:")
             print(f"\tTimestamp: {timestamp_time:.2f}")
             print(f"\tPosition: {position}")
             print(f"\tOrientation: {orientation}")
-            print(f"\tAction: {actions[self.sample_count]}")
+            print(f"\tGripper Status: {gripper_status}")
+            print(f"\tDelta Position: {delta_position}")
+            print(f"\tDelta Orientation: {delta_orientation}")
             print(f"\tObservation shape: {observation.shape}\n")
             self.sample_count += 1
 
@@ -195,19 +225,26 @@ class Recorder:
         while self.recording:
             self.record_sample()
             time.sleep(self.sample_interval)
+            
+    def finalize(self):
+        """Consolidate the dataset when recording is complete"""
+        self.dataset.consolidate(run_compute_stats=True)
+        print(f"Dataset consolidated and saved to {LEROBOT_HOME}/{self.dataset_name}")
 
 
 def main():
-    filename = input("Enter the filename to store the demonstration data in.\n")
-    sample_interval = float(input("Enter the sampling interval (in seconds) for data collection.\n"))
+    dataset_name = input("Enter the name for the demonstration dataset:\n")
+    sample_interval = float(input("Enter the sampling interval (in seconds) for data collection:\n"))
     camera = RealSenseCamera()
     rospy.init_node("endpoint_recorder")
-    with h5py.File(f"{filename}.hdf5", "w") as file:
-        recorder = Recorder(file, camera, sample_interval, store_observations=True)
-        print("Press <ENTER> to start recording a demonstration or press <q> to exit the program.")
-        recorder.record()
-        file.attrs["num_demos"] = recorder.demo_num
-        print(f"Total demonstrations recorded: {recorder.demo_num}")
+    
+    recorder = Recorder(dataset_name, camera, sample_interval, store_observations=True)
+    print("Press <ENTER> to start recording a demonstration or press <q> to exit the program.")
+    recorder.record()
+    
+    # Finalize and consolidate the dataset
+    recorder.finalize()
+    print(f"Total demonstrations recorded: {recorder.demo_num}")
     camera.close()
 
 
